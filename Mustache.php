@@ -14,6 +14,9 @@
  */
 class Mustache {
 
+	const VERSION      = '0.8.0';
+	const SPEC_VERSION = '1.1.2';
+
 	/**
 	 * Should this Mustache throw exceptions when it finds unexpected tags?
 	 *
@@ -290,6 +293,9 @@ class Mustache {
 
 		if ($partials !== null) $this->_partials = $partials;
 
+		$otag_orig = $this->_otag;
+		$ctag_orig = $this->_ctag;
+
 		if ($view) {
 			$this->_context = array($view);
 		} else if (empty($this->_context)) {
@@ -297,7 +303,12 @@ class Mustache {
 		}
 
 		$template = $this->_renderPragmas($template);
-		return $this->_renderTemplate($template, $this->_context);
+		$template = $this->_renderTemplate($template, $this->_context);
+
+		$this->_otag = $otag_orig;
+		$this->_ctag = $ctag_orig;
+
+		return $template;
 	}
 
 	/**
@@ -328,37 +339,42 @@ class Mustache {
 		if ($section = $this->_findSection($template)) {
 			list($before, $type, $tag_name, $content, $after) = $section;
 
-			$renderedContent = '';
+			$rendered_before = $this->_renderTags($before);
+
+			$rendered_content = '';
 			$val = $this->_getVariable($tag_name);
 			switch($type) {
 				// inverted section
 				case '^':
 					if (empty($val)) {
-						$renderedContent = $this->_renderTemplate($content);
+						$rendered_content = $this->_renderTemplate($content);
 					}
 					break;
 
 				// regular section
 				case '#':
-					if ($this->_varIsIterable($val)) {
+					// higher order sections
+					if ($this->_varIsCallable($val)) {
+						$rendered_content = $this->_renderTemplate(call_user_func($val, $content));
+					} else if ($this->_varIsIterable($val)) {
 						foreach ($val as $local_context) {
 							$this->_pushContext($local_context);
-							$renderedContent .= $this->_renderTemplate($content);
+							$rendered_content .= $this->_renderTemplate($content);
 							$this->_popContext();
 						}
 					} else if ($val) {
 						if (is_array($val) || is_object($val)) {
 							$this->_pushContext($val);
-							$renderedContent = $this->_renderTemplate($content);
+							$rendered_content = $this->_renderTemplate($content);
 							$this->_popContext();
 						} else {
-							$renderedContent = $this->_renderTemplate($content);
+							$rendered_content = $this->_renderTemplate($content);
 						}
 					}
 					break;
 			}
 
-			return $this->_renderTags($before) . $renderedContent . $this->_renderTemplate($after);
+			return $rendered_before . $rendered_content . $this->_renderTemplate($after);
 		}
 
 		return $this->_renderTags($template);
@@ -374,7 +390,7 @@ class Mustache {
 	 */
 	protected function _prepareSectionRegEx($otag, $ctag) {
 		return sprintf(
-			'/(?:(?<=\\n)[ \\t]*)?%s(?P<type>[%s])(?P<tag_name>.+?)%s\\n?/s',
+			'/(?:(?<=\\n)[ \\t]*)?%s(?:(?P<type>[%s])(?P<tag_name>.+?)|=(?P<delims>.*?)=)%s\\n?/s',
 			preg_quote($otag, '/'),
 			self::SECTION_TYPES,
 			preg_quote($ctag, '/')
@@ -400,6 +416,12 @@ class Mustache {
 		$section_stack = array();
 		$matches = array();
 		while (preg_match($regEx, $template, $matches, PREG_OFFSET_CAPTURE, $search_offset)) {
+			if (isset($matches['delims'][0])) {
+				list($otag, $ctag) = explode(' ', $matches['delims'][0]);
+				$regEx = $this->_prepareSectionRegEx($otag, $ctag);
+				$search_offset = $matches[0][1] + strlen($matches[0][0]);
+				continue;
+			}
 
 			$match    = $matches[0][0];
 			$offset   = $matches[0][1];
@@ -589,9 +611,6 @@ class Mustache {
 			return $template;
 		}
 
-		$otag_orig = $this->_otag;
-		$ctag_orig = $this->_ctag;
-
 		$first = true;
 		$this->_tagRegEx = $this->_prepareTagRegEx($this->_otag, $this->_ctag, true);
 
@@ -630,9 +649,6 @@ class Mustache {
 				$this->_tagRegEx = $this->_prepareTagRegEx($this->_otag, $this->_ctag);
 			}
 		}
-
-		$this->_otag = $otag_orig;
-		$this->_ctag = $ctag_orig;
 
 		return $html . $template;
 	}
@@ -717,7 +733,8 @@ class Mustache {
 	 * @return string
 	 */
 	protected function _renderEscaped($tag_name, $leading, $trailing) {
-		return $leading . htmlentities($this->_getVariable($tag_name), ENT_COMPAT, $this->_charset) . $trailing;
+		$rendered = htmlentities($this->_renderUnescaped($tag_name, '', ''), ENT_COMPAT, $this->_charset);
+		return $leading . $rendered . $trailing;
 	}
 
 	/**
@@ -749,7 +766,13 @@ class Mustache {
 	 * @return string
 	 */
 	protected function _renderUnescaped($tag_name, $leading, $trailing) {
-		return $leading . $this->_getVariable($tag_name) . $trailing;
+		$val = $this->_getVariable($tag_name);
+
+		if ($this->_varIsCallable($val)) {
+			$val = $this->_renderTemplate(call_user_func($val));
+		}
+
+		return $leading . $val . $trailing;
 	}
 
 	/**
@@ -940,6 +963,23 @@ class Mustache {
 	protected function _varIsIterable($var) {
 		return $var instanceof Traversable || (is_array($var) && !array_diff_key($var, array_keys(array_keys($var))));
 	}
+
+	/**
+	 * Higher order sections helper: tests whether the section $var is a valid callback.
+	 *
+	 * In Mustache.php, a variable is considered 'callable' if the variable is:
+	 *
+	 *  1. an anonymous function.
+	 *  2. an object and the name of a public function, i.e. `array($SomeObject, 'methodName')`
+	 *  3. a class name and the name of a public static function, i.e. `array('SomeClass', 'methodName')`
+	 *
+	 * @access protected
+	 * @param mixed $var
+	 * @return bool
+	 */
+	protected function _varIsCallable($var) {
+	  return !is_string($var) && is_callable($var);
+	}
 }
 
 
@@ -970,4 +1010,3 @@ class MustacheException extends Exception {
 	const UNKNOWN_PRAGMA           = 4;
 
 }
-
